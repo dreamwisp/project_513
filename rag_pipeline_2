@@ -1,0 +1,458 @@
+import os
+import sqlite3
+import pandas as pd
+import matplotlib.pyplot as plt
+import numpy as np
+import streamlit as st
+import ollama
+import sqlite3
+import pandas as pd 
+import numpy as np
+import contractions
+import re
+import multiprocessing
+import traceback
+import concurrent.futures
+from tqdm import tqdm
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+#from langchain_community.vectorstores import Chroma
+from langchain_chroma import Chroma
+from langchain_cohere import CohereEmbeddings 
+import faiss
+from langchain_core.documents.base import Document
+import chromadb
+from chromadb.config import Settings
+import os
+from dotenv import load_dotenv
+from langchain_ollama import OllamaEmbeddings
+from langchain.prompts import PromptTemplate
+from langchain.prompts import ChatPromptTemplate
+from langchain.retrievers.multi_query import MultiQueryRetriever
+from langchain.schema.runnable import RunnablePassthrough
+from langchain_ollama import OllamaLLM 
+from chromadb import PersistentClient
+from langchain_community.llms.ollama import Ollama
+from chromadb import Client
+from chromadb.config import Settings
+from chromadb.utils.embedding_functions import OllamaEmbeddingFunction
+import math, json
+from chromadb.config import DEFAULT_TENANT, DEFAULT_DATABASE, Settings
+from storage import FilesManager
+from langchain.schema.output_parser import StrOutputParser
+import chromadb.utils.embedding_functions as embedding_functions
+from langchain_community.embeddings import OllamaEmbeddings
+from chromadb.utils.embedding_functions import create_langchain_embedding
+
+
+def get_all_post_for_username(df, username):
+    masked_texts_df = df[df["username"] == username]["post_text"] # select appropiate
+    masked_texts_df = masked_texts_df.str.replace('\n','',regex=False) # remove '\n'
+    masked_texts_df = masked_texts_df.apply(contractions.fix) # fix contractions
+    masked_texts_df = masked_texts_df.apply(lambda x: re.sub(r'\s+',' ', x).strip())
+    return masked_texts_df.tolist()
+
+def embed(username, text):
+    chunks = split_data(text)
+    metadatas = [{"user": username} for _ in range(len(chunks))]
+    
+    db = get_vector_db()
+    documents = [
+        Document(page_content=chunk.page_content, metadata=meta)
+        for chunk, meta in zip(chunks, metadatas)
+    ]
+    
+    db.add_documents(documents)
+    print("Got db")
+   # db.persist() autopmatixcally donne inlater versions
+
+def split_data(text):
+    text_splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(
+        chunk_size=500, chunk_overlap=100 )
+    chunks = text_splitter.split_documents([Document(page_content=text)])
+    return chunks
+#from chromadb.utils.embedding_functions import create_langchain_embedding
+from langchain_chroma import ChromaEmbeddingFunction
+def get_vector_db(TEXT_EMBEDDING_MODEL="nomic-embed-text",CHROMA_PATH='analysis/chroma_dbs',COLLECTION_NAME="rag-local"):
+    lc_embedder = OllamaEmbeddings(model="nomic-embed-text")
+    #adapter    = create_langchain_embedding(lc_embedder)
+    adapter    = ChromaEmbeddingFunction(lc_embedder)
+    settings = Settings(
+        anonymized_telemetry=False,
+        persist_directory = CHROMA_PATH,
+    )
+    client = chromadb.PersistentClient( 
+        path=CHROMA_PATH,
+        settings=Settings(),
+        tenant=DEFAULT_TENANT,
+        database=DEFAULT_DATABASE,
+    ) 
+    #client = chromadb.PersistentClient(path=CHROMA_PATH)
+    collection = client.get_or_create_collection(name=COLLECTION_NAME)
+   
+    db = Chroma(
+        client=client,
+        collection_name =COLLECTION_NAME,
+        embedding_function=adapter,
+        persist_directory  = CHROMA_PATH,
+    )
+    return db
+
+def get_vector_for_batch(batch_id, capacity=100):
+    collection_name = f'rag-batch-{batch_id}'
+    print(f"Connecting to collection: {collection_name}")
+    lc_embedder = OllamaEmbeddings(model="nomic-embed-text")
+    adapter    = create_langchain_embedding(lc_embedder)
+    settings = Settings(
+        anonymized_telemetry = False,
+        persist_directory = CHROMA_PATH
+    )
+    #client = chromadb.PersistentClient(path=CHROMA_PATH)
+    client = chromadb.PersistentClient(
+        path=CHROMA_PATH,
+        settings=Settings(),
+        tenant=DEFAULT_TENANT,
+        database=DEFAULT_DATABASE,
+    )
+    try:
+        collection = client.get_or_create_collection(
+            name=collection_name,
+            metadata={
+                    "hnsw:space": "cosine", 
+                    "hnsw:efConstruction": 400,
+                    "hnsw:M": 128
+                   
+                    
+                },
+            embedding_function=adapter
+            )
+            
+            # Check if collection was successfully created
+        if collection is None:
+            raise ValueError(f"Failed to create collection {collection_name}")
+                
+        print(f"Collection {collection_name} ready")
+            
+            # Create Langchain Chroma wrapper
+        db = Chroma(
+                client=client,
+                collection_name=collection_name,
+                embedding_function=adapter,
+                persist_directory=CHROMA_PATH,
+            )
+        return db
+            
+    except Exception as e:
+        print(f"Error creating collection {collection_name}: {str(e)}")
+        raise
+            
+def get_batch_id_username(username, user_to_batch_map=None):
+    if user_to_batch_map is None:
+        return hash(username) % 10
+    else: 
+        return user_to_batch_map.get(username, 0)
+    
+def embed_single_post(user_and_df_posts, user_to_batch_map =None):
+    user, df_posts = user_and_df_posts
+    try:
+        docs = get_all_post_for_username(df_posts, user)
+        if not docs or len(docs) == 0:
+            print(f"No documents found for user {user}")
+            return
+        if docs:
+            print("getting batch id")
+            batch_id = get_batch_id_username(user, user_to_batch_map)
+            print("Batch id gotten: ", batch_id)
+            db = get_vector_for_batch(batch_id)
+            text = ' '.join(docs)
+            try:
+                chunks = split_data(text)
+                print(f"Split {len(chunks)} chunks for user {user}")
+                if len(chunks) == 0:
+                    print(f"Warning: No chunks generated for user {user}")
+                    return
+                
+                metadatas = [{"user": user} for _ in range(len(chunks))]
+                
+                documents = [
+                    Document(page_content=chunk.page_content, metadata=meta)
+                    for chunk, meta in zip(chunks, metadatas)
+                ]
+                #print(documents)
+                try:
+                        
+                    db.add_documents(documents)
+                except Exception as e:
+                    print(f"Error adding docsss for user {user}: {str(e)}")
+                        
+                print("About to add doc....")
+                #db.add_documents(documents)
+                print(f"Embedded user {user} in batch {batch_id}")
+            except Exception as e:
+                print("Exception after chunks: ", e)
+    except Exception as e:
+        print(f"Failed embedding for user {user}: {e}")
+    
+
+
+def embed_all_docs(df_posts):
+    
+    usernames = df_posts["username"].value_counts().index
+
+    num_batches = math.ceil(len(usernames) / BATCH_SIZE)
+    user_to_batch_map = {username: i % num_batches for i, username in enumerate(usernames)}
+    user_and_df_posts = [(user, df_posts) for user in usernames]
+    with tqdm(total= len(user_and_df_posts), desc="Embedding users") as pbar:
+        for i, (user, _) in enumerate(user_and_df_posts):
+            embed_single_post((user, df_posts), user_to_batch_map )
+            pbar.update(1)
+        #pool.map(embed_single_post,user_and_df_posts )
+    with open(f"{CHROMA_PATH}/user_batch_mapping.json", "w") as f:
+        json.dump(user_to_batch_map, f)
+    
+    return usernames, user_to_batch_map             
+ 
+def get_prompt():
+    # for embeddings
+      
+    QUERY_PROMPT = PromptTemplate(
+            input_variables=["question"],
+            template="""You are an AI language model assistant. Your task is to generate five
+            different versions of the given user question to retrieve relevant documents from
+            a vector database based on reddit language. By generating multiple perspectives on the user question, your
+            goal is to help the user overcome some of the limitations of the distance-based
+            similarity search. Provide these alternative questions separated by newlines.
+            Original question: {question}""",
+        )
+    
+    template = """You are an AI extraction assistant.
+
+        Retrieve the answer to "{question}" from the following context.
+        
+        - If the information is found, return it in JSON format like this: {{"output": <value>}}.
+        - If the information is NOT available in the context, return {{"output": "N/a"}}.
+        
+        Context:
+        {context}
+        
+        Question:
+        {question}
+        """
+
+    # from embeddings generate answer
+    prompt = ChatPromptTemplate.from_template(template)
+    return QUERY_PROMPT, prompt
+
+def query(query_term, metadata_username, user_to_batch_map=None):
+    print("Reached query")
+    #llm = ChatOllama(model=LLM_MODEL)
+    llm = OllamaLLM(model=LLM_MODEL)
+    print("model loaded")
+    #llm = load_model()                 
+    #db = get_vector_db() 
+    batch_id = get_batch_id_username(metadata_username, user_to_batch_map)
+    vector_store = get_vector_for_batch(batch_id)
+
+    QUERY_PROMPT, prompt = get_prompt()
+    print("got prompt")
+    #retriever = MultiChainRetriever.from_llm
+    
+    retriever = MultiQueryRetriever.from_llm(
+        llm=llm,
+        retriever=vector_store.as_retriever(
+            search_kwargs={
+              #  "k": 5,
+                "filter": {"user": metadata_username}}),
+        prompt = QUERY_PROMPT,
+    )
+    print("GOt Retriver")
+    #retrieved_context = retriever.invoke(query_term)
+    #print("Retrieved context: ", retrieved_context)
+   
+    chain = (
+        {"context": retriever, "question": RunnablePassthrough()}
+        | prompt
+        | llm
+        | StrOutputParser()
+    )
+     
+    response = chain.invoke({"question": query_term})
+    
+    return response
+
+def get_all_queries_one_user(metadata_username, user_to_batch_map=None):
+    query_age = """Given the following text, check if the user has ever explicitly or implicitly mentioned their age.
+        Look for:
+        - Direct statements (e.g., "I am 23", "I'm turning 30 next month")
+        - Indirect references to age (e.g., "as a teenager", "back when I was in college", "in my 40s")
+        - Mentions of birth year (e.g., "born in 1998")
+        - Life events tied to age (e.g., "just graduated high school at 18")
+        
+        If the user's age can be determined or reasonably estimated, return it in this JSON format:
+        {"age": <number>}
+        
+        If no clear information about age is found, return:
+        {"age": "N/a"}
+        
+        Be concise. Do not assume age based only on hobbies, job, or lifestyle unless explicitly tied to an age range.
+    """
+    age = query(query_age, metadata_username,user_to_batch_map)
+    print("\n age: ", age)
+    age = {"age": age}
+
+    query_country =  """Given the following text, infer the user's country of residence 
+        based on explicit mentions (e.g., 'I live in X'), cultural references, local events, holidays, timezones,
+        or language/dialect clues. If uncertain, explain why.
+        Return the result in this JSON format:
+        {"country": "<country name>"}
+        
+        - Use the full English name of the country if possible (e.g., "United States", "Germany", "Peru").
+        - If the country cannot be determined confidently, return:
+        {"country": "N/a"}
+        
+        If uncertain, you may optionally include an "explanation" field to clarify why the country could not be determined. Example:
+        {"country": "N/a", "explanation": "User only mentioned a city name without specifying the country."}
+    
+        """
+    country = query(query_country, metadata_username,user_to_batch_map)
+    print("\n country: ", country)
+    country = {"country": country}
+
+    query_gender = """Given the following text, infer the likely gender 
+        of the user based on relational terms (e.g., son/daughter), self-descriptions (e.g., guy/girl), and social
+        context clues (e.g., references to friendships, sports, etc.). If uncertain, explain why.
+        Return the result in this JSON format:
+        {"gender": "<male/female/other/unknown>"}
+        - Use "male" or "female" if there is sufficient explicit or very strong indirect evidence.
+        - Use "other" if the user self-identifies outside the binary (e.g., non-binary, genderfluid).
+        - Use "unknown" if the gender cannot be reasonably determined from the text.
+        
+        If unsure, briefly explain the uncertainty inside the JSON under an "explanation" field. Example:
+        {"gender": "unknown", "explanation": "No clear gendered terms or self-identifications found."}
+
+    """
+    gender = query(query_gender, metadata_username, user_to_batch_map)
+    print("\n gender: ", gender)
+    gender = {"gender": gender}
+
+    query_occupation =  """Given the following text, identify the user's primary occupation or main current activity.
+
+        This can include:
+        - Formal employment (e.g., 'software engineer', 'barista', 'teacher')
+        - Informal work (e.g., 'freelance artist', 'content creator')
+        - Education status (e.g., 'college student', 'high school senior')
+        - Being unemployed, retired, or a stay-at-home parent
+        
+        Look for:
+        - Explicit statements ("I work as...", "I'm a student at...")
+        - Clear contextual clues (mention of school, workplace, job search, retirement)
+        - Major time commitments or self-described roles
+        
+        Return the information in this JSON format:
+        {"occupation": "<description>"}
+        
+        If no clear occupation or major activity is found, return:
+        {"occupation": "N/a"}
+        
+        Be concise. Do not infer an occupation only from hobbies or vague lifestyle unless it is clearly indicated.
+    """
+    occupation = query(query_occupation, metadata_username, user_to_batch_map)
+    print("\n occupation: ", occupation)
+    occupation = {"occupation": occupation}
+    query_hobbies_interest = """ Given the following text, identify the user's hobbies and personal interests
+        based on explicit mentions (e.g., 'I love painting'), frequent activities, club or event participation, 
+        or casual mentions of favorite pastimes.
+        
+        Return the information in a JSON format, where each hobby is a key in the dictionary.
+        The value should be a short description or context if available. 
+        If no hobbies are found, return {"hobbies": "N/a"}.
+        
+        Example format:
+        {
+            "painting": "Enjoys painting landscapes during free time.",
+            "cycling": "Frequently mentions cycling with friends on weekends.",
+            "reading": "Likes reading fantasy novels."
+        }   
+    """
+    hobbies_interest = query(query_hobbies_interest, metadata_username, user_to_batch_map)
+    hobbies_interest = {"hobbies": hobbies_interest}
+    print("\n hobbies_interest: ", hobbies_interest)
+    return [age, country, gender, occupation, hobbies_interest]
+
+
+
+
+def main(df_posts, parallel= False, embed_posts=True):
+    if not os.path.exists("analysis/static_files"):
+        os.mkdir("analysis/static_files")
+    fManger = FilesManager("analysis/static_files/info_dump2.json")
+    user_to_batch_map = None
+    mapping_path = f"{CHROMA_PATH}/user_batch_mapping.json"
+    if os.path.exists(mapping_path):
+        import json
+        with open(mapping_path, "r") as f:
+            user_to_batch_map = json.load(f)
+    
+    if embed_posts:
+        usernames, user_to_batch_map = embed_all_docs(df_posts)
+    else:
+        not_usernames = fManger.stored_users
+        usernames= [user for user in df_posts["username"].unique().tolist() if user not in not_usernames]
+    print(usernames[0])
+ 
+    def handle_user(username):
+        response = get_all_queries_one_user(username, user_to_batch_map)
+        fManger.store_user((username, response))
+    if parallel:
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            list(tqdm(executor.map(handle_user, usernames), total=len(usernames), desc="Preprocessing users" ))
+    else:
+        for user in tqdm(usernames, desc="Processing users"):
+            handle_user(user)
+
+
+def check_compatibility():
+    import chromadb
+    import langchain_chroma
+    
+    print(f"ChromaDB version: {chromadb.__version__}")
+    print(f"Langchain Chroma package found: {langchain_chroma.__name__}")
+    
+    # Check if this version of chromadb supports metadata parameters
+    client = chromadb.PersistentClient(path=CHROMA_PATH)
+    try:
+        # Test creating a collection with metadata
+   
+        test_collection = client.get_or_create_collection(
+            name="test_compatibility",
+            metadata={
+                "hnsw:space": "cosine",
+                "hnsw:efConstruction": 400, 
+                "hnsw:M": 128
+            
+            }
+        )
+        print("ChromaDB supports metadata parameters ✓")
+    except TypeError:
+        print("WARNING: This version of ChromaDB might not support metadata parameters for collections")
+        # Fall back to creating without metadata
+
+
+if __name__ == "__main__":
+    BATCH_SIZE =500 
+    LLM_MODEL = 'mistral'
+    CHROMA_PATH = os.getenv('CHROMA_PATH', 'analysis/chroma_dbs2')
+    COLLECTION_NAME = os.getenv('COLLECTION_NAME', 'local-rag')
+    TEXT_EMBEDDING_MODEL = os.getenv('TEXT_EMBEDDING_MODEL', 'nomic-embed-text')
+    path = "scraper/i_513_project.db"
+  
+    conn = sqlite3.connect(path)
+    cursor = conn.cursor()
+    check_compatibility()
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
+    tables = cursor.fetchall()
+    table_names = [table[0] for table in tables]
+
+    sqlquery="SELECT * FROM posts"
+    df_posts = pd.read_sql(sqlquery,conn)
+ 
+    main(df_posts)
